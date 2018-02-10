@@ -29,6 +29,7 @@ from seahub.views import check_folder_permission
 # Get an instance of a logger
 logger = logging.getLogger(__name__)
 
+@login_required
 def slug(request, slug, page_name="home"):
     """Show wiki page.
     """
@@ -106,4 +107,44 @@ def slug(request, slug, page_name="home"):
                 "wiki_index_exists": wiki_index_exists,
                 "index_content": index_content,
                 "grps": joined_groups,
+            }, context_instance=RequestContext(request))
+
+@login_required
+def pages(request, slug):
+    """List wiki pages.
+    """
+    # get or 404
+    wiki = get_object_or_404(Wiki, slug=slug)
+
+    # perm check
+    if not wiki.has_read_perm(request.user):
+        raise Http404
+
+    username = request.user.username
+    if request.cloud_mode and request.user.org is not None:
+        org_id = request.user.org.org_id
+        joined_groups = seaserv.get_org_groups_by_user(org_id, username)
+    else:
+        joined_groups = seaserv.get_personal_groups_by_user(username)
+
+    if joined_groups:
+        joined_groups.sort(lambda x, y: cmp(x.group_name.lower(), y.group_name.lower()))
+
+    try:
+        repo = seafile_api.get_repo(wiki.repo_id)
+        if not repo:
+            assert False, "TODO"
+
+        pages = get_wiki_pages(repo)
+    except SearpcError:
+        return render_error(request, _('Internal Server Error'))
+    except WikiDoesNotExist:
+        return render_error(request, _('Wiki does not exists.'))
+
+    return render_to_response("wiki/personal_wiki_pages.html", {
+            "pages": pages,
+            "repo_id": repo.id,
+            "search_repo_id": repo.id,
+            "search_wiki": True,
+            "grps": joined_groups,
             }, context_instance=RequestContext(request))

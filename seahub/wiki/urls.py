@@ -5,6 +5,7 @@ from .views import *
 
 urlpatterns = patterns(
     '',
-    url('^(?P<slug>[^/]+)/$', slug, name='slug'),
+    url(r'^(?P<slug>[^/]+)/$', slug, name='slug'),
+    url(r'^(?P<slug>[^/]+)/pages/$', pages, name='pages'),
     url(r'^(?P<slug>[^/]+)/(?P<page_name>[^/]+)/$', slug, name='slug'),
 )

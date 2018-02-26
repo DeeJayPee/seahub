@@ -7,7 +7,8 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from seaserv import seafile_api
+from seaserv import (seafile_api, del_file, get_file_id_by_path,
+                     post_empty_file)
 from pysearpc import SearpcError
 from django.core.urlresolvers import reverse
 from django.db import IntegrityError
@@ -18,9 +19,17 @@ from django.utils.translation import ugettext as _
 from seahub.api2.authentication import TokenAuthentication
 from seahub.api2.throttling import UserRateThrottle
 from seahub.api2.utils import api_error
-from seahub.wiki.models import Wiki, DuplicateWikiNameError
-from seahub.wiki.utils import is_valid_wiki_name
-from seahub.utils import is_org_context
+from seahub.wiki.models import (Wiki, DuplicateWikiNameError, WikiDoesNotExist,
+                                WikiPageMissing)
+from seahub.wiki.utils import (is_valid_wiki_name, clean_page_name,
+                               get_wiki_pages, get_inner_file_url,
+                               get_wiki_dirent, get_wiki_page_object)
+from seahub.utils import is_org_context, render_error, get_service_url
+
+import urllib2
+from django.utils.http import urlquote
+from django.shortcuts import get_object_or_404
+from django.contrib import messages
 
 logger = logging.getLogger(__name__)
 
@@ -121,4 +130,181 @@ class WikiView(APIView):
         wiki.permission = permission
         wiki.save()
         return Response(wiki.to_dict())
+
+
+class WikiPagesView(APIView):
+    authentication_classes = (TokenAuthentication, SessionAuthentication)
+    permission_classes = (IsAuthenticated, )
+    throttle_classes = (UserRateThrottle, )
+
+    def get(slef, request, slug):
+        """List all pages in a wiki.
+        """
+        try:
+            wiki = Wiki.objects.get(slug=slug)
+        except Wiki.DoesNotExist:
+            error_msg = "Wiki not found."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        # perm check
+        if not wiki.has_read_perm(request.user):
+            error_msg = "Permission denied"
+            return api_error(status.HTTP_403_FORBIDDEN, error_msg)
+
+        try:
+            repo = seafile_api.get_repo(wiki.repo_id)
+            if not repo:
+                error_msg = "Wiki does not exists."
+                return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+        except SearpcError:
+            error_msg = "Internal Server Error"
+            return api_error(status.HTTP_500_INTERNAL_SERVER_ERROR, error_msg)
+        except WikiDoesNotExist:
+            error_msg = "Wiki does not exists."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        pages = get_wiki_pages(repo)
+        wiki_pages_object = []
+        for page_name in pages:
+            wiki_page_object = get_wiki_page_object(request, slug, repo, page_name)
+            wiki_pages_object.append(wiki_page_object)
+
+        return Response({
+                "data": wiki_pages_object
+                })
+
+    def post(self, request, slug):
+        """ Add a page in a wiki
+        """
+        try:
+            wiki = Wiki.objects.get(slug=slug)
+        except Wiki.DoesNotExist:
+            error_msg = "Wiki not found."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        # perm check
+        username = request.user.username
+        if wiki.username != username:
+            error_msg = 'Permission denied.'
+            return api_error(status.HTTP_403_FORBIDDEN, error_msg)
+
+        page_name = request.POST.get('name', '')
+        if not page_name:
+            error_msg = 'Name is not available'
+            return api_error(status.HTTP_400_BAD_REQUEST, error_msg)
+        
+        page_name = clean_page_name(page_name)
+        filename = page_name + ".md"
+        filepath = "/" + page_name + ".md"
+
+        try:
+            repo = seafile_api.get_repo(wiki.repo_id)
+            if not repo:
+                error_msg = "Wiki does not exists."
+                return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+        except SearpcError:
+            error_msg = "Internal Server Error"
+            return api_error(status.HTTP_500_INTERNAL_SERVER_ERROR, error_msg)
+        except WikiDoesNotExist:
+            error_msg = "Wiki does not exists."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        # check whether file exists
+        if get_file_id_by_path(repo.id, filepath):
+            error_msg = 'Page name is exists'
+            return api_error(status.HTTP_400_BAD_REQUEST, error_msg)
+
+        if not post_empty_file(repo.id, "/", filename, request.user.username):
+            error_msg = 'Failed to create wiki page. Please retry later.'
+            return api_error(status.HTTP_400_BAD_REQUEST, error_msg)
+
+        wiki_page_object = get_wiki_page_object(request, slug, repo, page_name)
+
+        return Response(wiki_page_object)
+
+
+class WikiPageView(APIView):
+    authentication_classes = (TokenAuthentication, SessionAuthentication)
+    permission_classes = (IsAuthenticated, )
+    throttle_classes = (UserRateThrottle, )
+
+    def get(self, request, slug, page_name="home"):
+        """Get content of a wiki
+        """
+        try:
+            wiki = Wiki.objects.get(slug=slug)
+        except Wiki.DoesNotExist:
+            error_msg = "Wiki not found."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        # perm check
+        if not wiki.has_read_perm(request.user):
+            error_msg = 'Permission denied.'
+            return api_error(status.HTTP_403_FORBIDDEN, error_msg)
+
+        page_name = clean_page_name(page_name)
+
+        try:
+            repo = seafile_api.get_repo(wiki.repo_id)
+            if not repo:
+                error_msg = "Wiki does not exists."
+                return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+        except SearpcError:
+            error_msg = "Internal Server Error."
+            return api_error(status.HTTP_500_INTERNAL_SERVER_ERROR, error_msg)
+        except WikiDoesNotExist:
+            error_msg = "Wiki does not exists."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        try:
+            wiki_dirent = get_wiki_dirent(repo.id, page_name)
+        except WikiPageMissing:
+            error_msg = "Page dose not exits."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        url = get_inner_file_url(repo, wiki_dirent.obj_id, wiki_dirent.obj_name)
+        file_response = urllib2.urlopen(url)
+        content = file_response.read()
+
+        wiki_page_object = get_wiki_page_object(request, slug, repo, page_name)
+
+        return Response({
+            "meta": wiki_page_object,
+            "content": content
+            })
+
+    def delete(self, request, slug, page_name):
+        """Delete a page in a wiki
+        """
+        try:
+            wiki = Wiki.objects.get(slug=slug)
+        except Wiki.DoesNotExist:
+            error_msg = "Wiki not found."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        username = request.user.username
+        if wiki.username != username:
+            error_msg = 'Permission denied.'
+            return api_error(status.HTTP_403_FORBIDDEN, error_msg)
+
+        try:
+            repo = seafile_api.get_repo(wiki.repo_id)
+            if not repo:
+                error_msg = "Wiki does not exists."
+                return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+        except SearpcError:
+            error_msg = "Internal Server Error."
+            return api_error(status.HTTP_500_INTERNAL_SERVER_ERROR, error_msg)
+        except WikiDoesNotExist:
+            error_msg = "Wiki does not exists."
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        file_name = page_name + ".md"
+
+        if del_file(repo.id, '/', file_name, username):
+            messages.success(request._request, 'Successfully deleted "%s".' % page_name)
+        else:
+            messages.error(request._request, 'Failed to delete "%s". Please retry later.' % page_name)
+
+        return Response()
 
